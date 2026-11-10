@@ -8,7 +8,10 @@ import json
 import asyncio
 import logging
 import threading
-from datetime import datetime
+import copy
+import tempfile
+from local_security import credentials, redacted, preserve_secrets
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
@@ -17,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import secrets
 
 # 添加 src 目录到路径
@@ -33,6 +36,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from monitor_core import MonitorCore, get_default_sites
 from database.storage import Storage, BidInfo
 from ai_guard import AIGuard
+from competitor import CompetitorService, PLATFORMS, parse_companies
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -42,6 +46,9 @@ logger = logging.getLogger(__name__)
 class AppState:
     def __init__(self):
         self.is_running = False
+        self.continuous = False
+        self.task_lock = threading.Lock()
+        self.task_token = None
         self.monitor_core: Optional[MonitorCore] = None
         self.scheduler: Optional[AsyncIOScheduler] = None
         self.last_run_time: Optional[datetime] = None
@@ -68,14 +75,14 @@ class AppState:
         logger.info(message)
 
 app_state = AppState()
+competitor_service = CompetitorService(app_state.storage.db_path, log=app_state.add_log)
 
 # 配置文件路径
 CONFIG_FILE = os.path.join(BASE_DIR, 'server', 'server_config.json')
 
 # HTTP Basic 认证配置
 security = HTTPBasic()
-AUTH_USERNAME = "CDKJ"
-AUTH_PASSWORD = "cdkj"
+AUTH_USERNAME, AUTH_PASSWORD = credentials()
 
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
     """验证用户名和密码"""
@@ -150,20 +157,40 @@ def load_config() -> Dict[str, Any]:
     return default_config
 
 def save_config(config: Dict[str, Any]):
-    """保存配置"""
+    """Atomic replacement; error must reach the API, never acknowledge unsaved data."""
+    name = None
     try:
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        directory = os.path.dirname(CONFIG_FILE)
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=directory,prefix='.config-',suffix='.tmp',delete=False) as f:
+            name = f.name
             json.dump(config, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"保存配置失败: {e}")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(name, CONFIG_FILE)
+    except (OSError, TypeError, ValueError):
+        logger.error('保存配置失败；原配置未更新')
+        raise HTTPException(status_code=500, detail='配置写入失败，未保存，请检查磁盘空间和文件权限')
+    finally:
+        if name and os.path.isfile(name):
+            os.unlink(name)
+
+
+def commit_config(changes):
+    candidate = copy.deepcopy(app_state.config)
+    candidate.update(preserve_secrets(changes, candidate))
+    for contact in candidate.get('contacts', []):
+        contact.setdefault('id', secrets.token_hex(12))
+    save_config(candidate)
+    app_state.config = candidate
+
 
 # Pydantic 模型
 class ConfigModel(BaseModel):
     keywords: Optional[str] = None
     exclude: Optional[str] = None
     must_contain: Optional[str] = None
-    interval: Optional[int] = None
+    interval: Optional[int] = Field(default=None, ge=1, le=10080)
     enabled_sites: Optional[List[str]] = None
     email_enabled: Optional[bool] = None
     sms_enabled: Optional[bool] = None
@@ -181,7 +208,52 @@ class StatusResponse(BaseModel):
     interval: int
 
 # 定时任务：执行监控
-async def run_monitor_task():
+def reserve_monitor():
+    if not app_state.task_lock.acquire(blocking=False):
+        return None
+    token = object()
+    app_state.task_token = token
+    app_state.current_task_running = True
+    return token
+
+
+def release_monitor(token):
+    if app_state.task_token is token:
+        app_state.task_token = None
+        app_state.current_task_running = False
+        app_state.task_lock.release()
+
+
+async def run_monitor_task(token=None):
+    if token is None:
+        if not app_state.continuous or app_state.stop_event.is_set():
+            return
+        token = reserve_monitor()
+        if token is None:
+            return
+    elif app_state.task_token is not token:
+        return
+    worker = None
+    try:
+        if app_state.stop_event.is_set():
+            return
+        worker = asyncio.create_task(_execute_monitor_task())
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # run_in_executor cancellation does not stop its thread. Retain the reservation.
+            app_state.stop_event.set()
+            app_state.continuous = app_state.is_running = False
+            await worker
+            raise
+    finally:
+        if not app_state.continuous:
+            app_state.is_running = False
+            app_state.next_run_time = None
+        release_monitor(token)
+
+
+async def _execute_monitor_task():
     """执行一次监控任务"""
     # 检查是否应该运行
     if not app_state.is_running:
@@ -193,14 +265,12 @@ async def run_monitor_task():
         return
     
     # 标记任务正在运行
-    app_state.current_task_running = True
-    
     app_state.add_log("=" * 40)
     app_state.add_log("开始执行检索任务...")
     app_state.last_run_time = datetime.now()
     
     try:
-        config = app_state.config
+        config = copy.deepcopy(app_state.config)
         keywords = [k.strip() for k in config.get('keywords', '').split(',') if k.strip()]
         exclude = [k.strip() for k in config.get('exclude', '').split(',') if k.strip()]
         must_contain = [k.strip() for k in config.get('must_contain', '').split(',') if k.strip()]
@@ -217,12 +287,14 @@ async def run_monitor_task():
             exclude_keywords=exclude,
             must_contain_keywords=must_contain,
             log_callback=app_state.add_log,
-            ai_config=ai_config
+            ai_config=ai_config, db_path=app_state.storage.db_path
         )
         
+  
         # 设置启用的网站
         monitor.config['crawler'] = monitor.config.get('crawler', {})
         monitor.config['crawler']['enabled_sites'] = config.get('enabled_sites', [])
+        monitor.config['custom_sites'] = config.get('custom_sites', [])
         # 使用配置中的Selenium设置
         monitor.config['crawler']['use_selenium'] = config.get('use_selenium', False)
         if config.get('use_selenium'):
@@ -254,7 +326,6 @@ async def run_monitor_task():
         # 检查是否被中断
         if app_state.stop_event.is_set():
             app_state.add_log("检索任务被中断")
-            app_state.current_task_running = False
             return
         
         new_count = result.get('new_count', 0)
@@ -268,7 +339,6 @@ async def run_monitor_task():
         app_state.add_log(f"检索任务异常: {e}")
         logger.exception("Monitor task error")
     finally:
-        app_state.current_task_running = False
         # 清除进度信息
         app_state.progress_current = 0
         app_state.progress_total = 0
@@ -283,7 +353,7 @@ async def run_monitor_task():
     app_state.add_log(f"📊 今日已完成第 {app_state.today_rounds} 轮监控")
     
     # 任务完成后，调度下一次执行（仅在仍在运行时）
-    if app_state.is_running and not app_state.stop_event.is_set():
+    if app_state.continuous and not app_state.stop_event.is_set():
         interval = app_state.config.get('interval', 20)
         from datetime import timedelta
         from apscheduler.triggers.date import DateTrigger
@@ -410,6 +480,8 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时
     app_state.config = load_config()
+    for contact in app_state.config.get('contacts', []):
+        contact.setdefault('id', secrets.token_hex(12))
     app_state.add_log("BidMonitor 服务器已启动")
     
     yield
@@ -417,6 +489,7 @@ async def lifespan(app: FastAPI):
     # 关闭时
     if app_state.scheduler and app_state.scheduler.running:
         app_state.scheduler.shutdown()
+    competitor_service.close()
     app_state.add_log("BidMonitor 服务器已关闭")
 
 # 创建 FastAPI 应用
@@ -430,7 +503,7 @@ app = FastAPI(
 # 添加CORS中间件，允许前端跨域访问
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源
+    allow_origins=[x.strip() for x in os.environ.get('BIDMONITOR_ALLOWED_ORIGINS', '').split(',') if x.strip()],  # 默认仅同源
     allow_credentials=True,
     allow_methods=["*"],  # 允许所有HTTP方法
     allow_headers=["*"],  # 允许所有请求头
@@ -452,7 +525,7 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
                 if scheme.lower() == "basic":
                     decoded = base64.b64decode(credentials).decode("utf-8")
                     username, password = decoded.split(":", 1)
-                    if username == AUTH_USERNAME and password == AUTH_PASSWORD:
+                    if secrets.compare_digest(username, AUTH_USERNAME) and secrets.compare_digest(password, AUTH_PASSWORD):
                         return await call_next(request)
             except Exception:
                 pass
@@ -482,25 +555,120 @@ async def root():
         return FileResponse(index_path)
     return HTMLResponse("<h1>BidMonitor 服务正在运行</h1><p>请访问 /static/index.html</p>")
 
+def _local_created_at(bid):
+    """SQLite CURRENT_TIMESTAMP 为 UTC；展示和今日统计统一使用 UTC+8。"""
+    value = getattr(bid, 'created_at', None)
+    if not value:
+        return None
+    try:
+        created = datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return created.astimezone(timezone(timedelta(hours=8)))
+
+
+def _result_item(bid):
+    created = _local_created_at(bid)
+    return {
+        'title': bid.title,
+        'url': bid.url,
+        'source': bid.source,
+        'pub_date': bid.publish_date or None,
+        'collected_at': created.strftime('%Y-%m-%d %H:%M:%S') if created else None,
+    }
+
+
+class CompetitorQueryRequest(BaseModel):
+    company_text: str
+    platforms: List[str]
+    notice_urls: List[str] = []
+
+
+class CompetitorManualRequest(BaseModel):
+    platform: str
+    company: str
+
+
+@app.get("/api/competitors/config")
+async def competitor_config():
+    return {'company_text': app_state.config.get('competitor_companies', ''),
+            'platforms': app_state.config.get('competitor_platforms', list(PLATFORMS)),
+            'available': [{'id': key, 'name': value['name'], 'url': value['url']} for key, value in PLATFORMS.items()]}
+
+
+@app.post("/api/competitors/query")
+async def competitor_query(req: CompetitorQueryRequest, background_tasks: BackgroundTasks):
+    try:
+        state = competitor_service.reserve(req.company_text, req.platforms, getattr(req, 'notice_urls', []))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        commit_config({'competitor_companies': '\n'.join(state['companies']), 'competitor_platforms': req.platforms})
+    except Exception:
+        with competitor_service.lock:
+            competitor_service.state['running'] = False
+            for entry in competitor_service.state['entries']:
+                entry.update(status='cancelled', message='配置未保存，查询未启动')
+        raise
+    async def execute():
+        await asyncio.get_running_loop().run_in_executor(None, competitor_service.run)
+    background_tasks.add_task(execute)
+    return state
+
+
+@app.get("/api/competitors/status")
+async def competitor_status():
+    return competitor_service.snapshot()
+
+
+@app.post("/api/competitors/stop")
+async def competitor_stop():
+    competitor_service.stop.set()
+    return {'message': '已请求停止，将在当前页面操作结束后停止'}
+
+
+@app.get("/api/competitors/results")
+async def competitor_results(company_text: str = ''):
+    try:
+        companies = parse_companies(company_text) if company_text.strip() else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return dict(competitor_service.records.counts(companies), items=competitor_service.records.list(companies, limit=200),
+                summary=competitor_service.records.summary(companies), display_limit=200)
+
+
+@app.post("/api/competitors/manual")
+async def competitor_manual(req: CompetitorManualRequest):
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, competitor_service.open_manual, req.platform, req.company)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail='无法打开本机浏览器：'+type(exc).__name__)
+
+
 @app.get("/api/status")
 async def get_status():
     """获取监控状态"""
-    # 统计今日新增
-    today_str = datetime.now().strftime('%Y-%m-%d')
+    # 今日新增按实际入库时间统计，不能用来源的发布日期代替。
+    today = datetime.now(timezone(timedelta(hours=8))).date()
     all_bids = app_state.storage.get_all() if hasattr(app_state.storage, 'get_all') else []
-    
-    # publish_date 是字符串格式如 "2025-12-18"
     today_new = 0
     for b in all_bids:
-        if b.publish_date and b.publish_date.startswith(today_str):
+        created = _local_created_at(b)
+        if created and created.date() == today:
             today_new += 1
     
+    service = globals().get('competitor_service')
+    competitor_counts = service.records.counts() if service else {'total': 0, 'today_new': 0}
     return {
         "is_running": app_state.is_running,
         "last_run_time": app_state.last_run_time.strftime("%Y-%m-%d %H:%M:%S") if app_state.last_run_time else None,
         "next_run_time": app_state.next_run_time.strftime("%Y-%m-%d %H:%M:%S") if app_state.next_run_time else None,
-        "total_bids": len(all_bids),
-        "today_new": today_new,
+        "total_bids": len(all_bids) + competitor_counts['total'],
+        "today_new": today_new + competitor_counts['today_new'],
         "today_rounds": app_state.today_rounds,
         "interval": app_state.config.get('interval', 20),
         # 进度信息
@@ -510,94 +678,69 @@ async def get_status():
         "is_crawling": app_state.current_task_running
     }
 
-@app.post("/api/start")
+@app.post('/api/start')
 async def start_monitor(background_tasks: BackgroundTasks):
-    """开始监控"""
     if app_state.is_running:
-        return {"success": False, "message": "监控已在运行中"}
-    
-    # 清除停止事件
+        raise HTTPException(409, '监控已在运行')
+    token = reserve_monitor()
+    if token is None:
+        raise HTTPException(409, '上一任务仍在执行或停止中，请等待')
+    try:
+        app_state.stop_event.clear()
+        app_state.continuous = app_state.is_running = True
+        if not app_state.scheduler or not app_state.scheduler.running:
+            app_state.scheduler = AsyncIOScheduler()
+            app_state.scheduler.start()
+        app_state.next_run_time = None
+        background_tasks.add_task(run_monitor_task, token)
+    except Exception:
+        app_state.continuous = app_state.is_running = False
+        release_monitor(token)
+        raise
+    return {'success': True, 'message': '监控已启动'}
+
+
+@app.post('/api/stop')
+async def stop_monitor():
+    app_state.stop_event.set()
+    app_state.continuous = app_state.is_running = False
+    # Remove queued schedule; do not cancel a running executor and falsely release its lock.
+    if app_state.scheduler and app_state.scheduler.running:
+        app_state.scheduler.remove_all_jobs()
+    app_state.next_run_time = None
+    return {'success': True, 'message': '已请求停止，等待当前任务退出' if app_state.task_token else '监控已停止'}
+
+
+@app.post('/api/run-once')
+async def run_once(background_tasks: BackgroundTasks):
+    token = reserve_monitor()
+    if token is None:
+        raise HTTPException(409, '已有检索任务执行或停止中，请勿重复提交')
     app_state.stop_event.clear()
     app_state.is_running = True
-    interval = app_state.config.get('interval', 20)
-    
-    # 创建调度器（不立即添加定时任务，任务完成后再调度下一次）
-    app_state.scheduler = AsyncIOScheduler()
-    app_state.scheduler.start()
-    
-    # 立即执行一次（next_run_time会在任务完成后设置）
     app_state.next_run_time = None
-    background_tasks.add_task(run_monitor_task)
-    
-    app_state.add_log(f"✅ 监控已启动，间隔 {interval} 分钟")
-    
-    return {"success": True, "message": "监控已启动"}
-
-@app.post("/api/stop")
-async def stop_monitor():
-    """停止监控"""
-    if not app_state.is_running:
-        return {"success": False, "message": "监控未在运行"}
-    
-    # 设置停止事件，通知正在运行的任务中断
-    app_state.stop_event.set()
-    app_state.is_running = False
-    
-    # 关闭调度器
     if app_state.scheduler and app_state.scheduler.running:
-        app_state.scheduler.shutdown(wait=False)
-        app_state.scheduler = None
-    
-    app_state.next_run_time = None
-    app_state.add_log("⏹️ 监控已停止")
-    
-    # 如果有任务正在运行，提示用户
-    if app_state.current_task_running:
-        app_state.add_log("⚠️ 正在等待当前检索任务完成中断...")
-    
-    return {"success": True, "message": "监控已停止"}
+        app_state.scheduler.remove_all_jobs()
+    background_tasks.add_task(run_monitor_task, token)
+    app_state.add_log('手动检索已受理')
+    return {'success': True, 'message': '已开始检索'}
 
-@app.post("/api/run-once")
-async def run_once(background_tasks: BackgroundTasks):
-    """立即执行一次检索（不需要启动监控也可使用）"""
-    # 记录原始状态
-    was_running = app_state.is_running
-    app_state.stop_event.clear()  # 确保stop_event未设置
-    
-    async def manual_run_task():
-        """手动运行任务的包装函数"""
-        # 临时设置is_running为True以允许任务执行
-        app_state.is_running = True
-        try:
-            await run_monitor_task()
-        finally:
-            # 如果原来不在运行，则恢复为停止状态
-            if not was_running:
-                app_state.is_running = False
-                app_state.next_run_time = None
-    
-    background_tasks.add_task(manual_run_task)
-    app_state.add_log("🔍 手动触发检索...")
-    return {"success": True, "message": "已开始检索"}
 
 @app.get("/api/config")
 async def get_config():
     """获取配置"""
-    config = app_state.config.copy()
-    # 不再隐藏敏感信息，让前端能正确显示已保存的值
-    return config
+    return redacted(app_state.config)
 
 @app.post("/api/config")
 async def update_config(config: ConfigModel):
     """更新配置"""
-    update_data = config.dict(exclude_unset=True)
-    app_state.config.update(update_data)
-    save_config(app_state.config)
+    update_data = config.model_dump(exclude_unset=True, exclude_none=True)
+    commit_config(update_data)
     
     # 如果正在运行且间隔时间改变，重新调度
     if app_state.is_running and 'interval' in update_data:
         new_interval = update_data['interval']
-        if app_state.scheduler:
+        if app_state.scheduler and app_state.scheduler.get_job('monitor_job'):
             app_state.scheduler.reschedule_job(
                 'monitor_job',
                 trigger=IntervalTrigger(minutes=new_interval)
@@ -626,8 +769,7 @@ async def get_sites():
 @app.post("/api/sites")
 async def update_sites(enabled_sites: List[str]):
     """更新启用的网站"""
-    app_state.config['enabled_sites'] = enabled_sites
-    save_config(app_state.config)
+    commit_config({'enabled_sites': enabled_sites})
     return {"success": True, "message": "网站配置已更新"}
 
 @app.get("/api/custom-sites")
@@ -638,8 +780,7 @@ async def get_custom_sites():
 @app.post("/api/custom-sites")
 async def update_custom_sites(custom_sites: List[Dict[str, Any]]):
     """更新自定义网站列表"""
-    app_state.config['custom_sites'] = custom_sites
-    save_config(app_state.config)
+    commit_config({'custom_sites': custom_sites})
     app_state.add_log(f"📋 自定义网站已更新，共 {len(custom_sites)} 个")
     return {"success": True, "message": "自定义网站已更新"}
 
@@ -647,8 +788,9 @@ async def update_custom_sites(custom_sites: List[Dict[str, Any]]):
 async def get_results(limit: int = 50, offset: int = 0):
     """获取招标结果"""
     all_bids = app_state.storage.get_all() if hasattr(app_state.storage, 'get_all') else []
-    # 按 publish_date 时间倒序（字符串格式 "2025-12-18"）
-    all_bids.sort(key=lambda x: x.publish_date or "", reverse=True)
+    # 新采集记录优先显示；没有发布日期的企业记录也不会沉到历史结果底部。
+    all_bids.sort(key=lambda b: _local_created_at(b) or
+                  datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     
     total = len(all_bids)
     bids = all_bids[offset:offset + limit]
@@ -657,15 +799,7 @@ async def get_results(limit: int = 50, offset: int = 0):
         "total": total,
         "offset": offset,
         "limit": limit,
-        "items": [
-            {
-                "title": b.title,
-                "url": b.url,
-                "source": b.source,
-                "pub_date": b.publish_date or None,
-            }
-            for b in bids
-        ]
+        "items": [_result_item(b) for b in bids]
     }
 
 @app.get("/api/logs")
@@ -682,64 +816,41 @@ async def clear_logs():
     return {"success": True, "message": "日志已清空"}
 
 @app.delete("/api/history")
-async def clear_history():
-    """清空历史数据"""
-    app_state.storage.clear_all()
-    app_state.add_log("🗑️ 历史数据已清空")
-    return {"success": True, "message": "历史数据已清空"}
+async def clear_history(scope: str = '', confirm: bool = False):
+    if scope not in ('bids', 'competitors', 'all') or not confirm:
+        raise HTTPException(400, '请选择清理范围并明确确认')
+    token = reserve_monitor()
+    if token is None:
+        raise HTTPException(409, '检索执行中，不能清理历史')
+    try:
+        with competitor_service.lock:
+            if competitor_service.state['running']:
+                raise HTTPException(409, '竞品查询执行中，不能清理历史')
+            app_state.storage.clear_all(scope)
+    finally:
+        release_monitor(token)
+    labels = {'bids':'普通标讯','competitors':'竞品记录及版本','all':'全部标讯、竞品记录及版本'}
+    app_state.add_log('已清理：' + labels[scope])
+    return {'success': True, 'message': '已清理：' + labels[scope]}
 
 @app.get("/api/contacts")
 async def get_contacts():
     """获取联系人列表"""
-    return app_state.config.get('contacts', [])
+    return redacted(app_state.config.get('contacts', []))
 
 @app.post("/api/contacts")
 async def update_contacts(contacts: List[Dict[str, Any]]):
     """更新联系人列表"""
-    # 保留原有联系人的敏感字段
-    old_contacts = app_state.config.get('contacts', [])
-    old_contacts_by_name = {c.get('name'): c for c in old_contacts}
-    
-    for contact in contacts:
-        name = contact.get('name', '')
-        old_contact = old_contacts_by_name.get(name, {})
-        
-        # 保留email_password如果前端没有传入新值
-        if not contact.get('email_password') and old_contact.get('email_password'):
-            contact['email_password'] = old_contact['email_password']
-        
-        # 保留wechat_token如果前端传入空值但原来有值
-        # (注意：wechat_token用户可能想清空，这里不强制保留)
-    
-    app_state.config['contacts'] = contacts
-    save_config(app_state.config)
+    commit_config({'contacts': contacts})
     app_state.add_log(f"📋 联系人配置已更新，共 {len(contacts)} 人")
     return {"success": True, "message": "联系人已更新"}
 
 @app.post("/api/config/full")
 async def update_full_config(config: Dict[str, Any]):
     """更新完整配置（包括通知配置）"""
-    # 保留敏感字段如果前端没有传入
-    for key in ['sms_config', 'voice_config']:
-        if key in config and key in app_state.config:
-            if isinstance(config[key], dict):
-                for secret_key in ['access_key_secret']:
-                    if config[key].get(secret_key) in ['', None, '***']:
-                        config[key][secret_key] = app_state.config[key].get(secret_key, '')
-    
-    if 'ai_config' in config and 'ai_config' in app_state.config:
-        if config['ai_config'].get('api_key') in ['', None, '***']:
-            config['ai_config']['api_key'] = app_state.config.get('ai_config', {}).get('api_key', '')
-    
-    if 'email_configs' in config and config['email_configs']:
-        for i, email_cfg in enumerate(config['email_configs']):
-            if email_cfg.get('password') in ['', None]:
-                old_configs = app_state.config.get('email_configs', [])
-                if i < len(old_configs):
-                    email_cfg['password'] = old_configs[i].get('password', '')
-    
-    app_state.config.update(config)
-    save_config(app_state.config)
+    if 'interval' in config and (not isinstance(config['interval'], int) or not 1 <= config['interval'] <= 10080):
+        raise HTTPException(400, '检索间隔必须为1至10080分钟')
+    commit_config(config)
     return {"success": True, "message": "配置已更新"}
 
 # 测试通知请求模型

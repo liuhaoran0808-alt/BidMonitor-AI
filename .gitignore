@@ -18,6 +18,8 @@ venv/
 # 敏感配置文件（包含密码和API密钥）
 user_config.json
 server/server_config.json
+server/auth.local.json
+.local-fix-backups/
 
 # 数据文件
 data/

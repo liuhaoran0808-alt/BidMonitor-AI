@@ -77,9 +77,6 @@ class BaseCrawler(ABC):
         Returns:
             页面HTML内容，失败返回None
         """
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
         for attempt in range(self.max_retries):
             try:
                 self.logger.debug(f"正在请求: {url} (尝试 {attempt + 1}/{self.max_retries})")
@@ -89,7 +86,7 @@ class BaseCrawler(ABC):
                     params=params,
                     headers=self._get_headers(),
                     timeout=self.timeout,
-                    verify=False,  # 跳过SSL证书验证
+                    verify=True,  # 验证官网证书；企业代理可用 REQUESTS_CA_BUNDLE 配置信任链
                     allow_redirects=True
                 )
                 response.raise_for_status()

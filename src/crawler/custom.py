@@ -24,7 +24,6 @@ class CustomCrawler(BaseCrawler):
     def parse(self, html: str) -> List[BidInfo]:
         soup = self.parse_html(html)
         bids = []
-        today = datetime.now().strftime('%Y-%m-%d')
         
         # 提取所有链接
         seen_urls = set()
@@ -52,7 +51,7 @@ class CustomCrawler(BaseCrawler):
             bids.append(BidInfo(
                 title=text,
                 url=full_url,
-                publish_date=today, # 通用爬虫很难准确提取日期，使用当前日期
+                publish_date="", # 无可靠来源日期，留空；添加时间由存储层记录
                 source=self.name
             ))
             

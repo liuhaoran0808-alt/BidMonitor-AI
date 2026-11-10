@@ -505,7 +505,8 @@
             padding: 20px;
             color: var(--text-secondary)
         }
-    </style>
+    #page-competitors .container{max-width:1200px}.cmp-table{width:100%;border-collapse:collapse;font-size:13px}.cmp-table th,.cmp-table td{padding:10px;border:1px solid #e4e8ef;text-align:left;vertical-align:top;min-width:110px}.cmp-table th{background:#f5f7fa}.cmp-table td:first-child{min-width:220px}.cmp-table small{color:#64748b}
+</style>
 </head>
 
 <body>
@@ -538,7 +539,7 @@
                     </div>
                     <div class="stat-item">
                         <div class="stat-value" id="totalBids">-</div>
-                        <div class="stat-label">总计招标</div>
+                        <div class="stat-label">总计记录</div>
                     </div>
                 </div>
                 <div class="countdown-box" id="countdownBox">
@@ -593,6 +594,23 @@
         </div>
     </div>
     <!-- 网站管理 -->
+    <div id="page-competitors" class="page">
+        <div class="container">
+            <div class="card">
+                <div class="card-title">🏢 企业招投标信息汇总</div>
+                <p class="hint">输入企业全称，一行一家，最多5家。每次按当前输入动态查询指定平台，不需要填写企业结果页网址；原六个平台采集当前页企业/业绩信息；全国交易平台按企业全称精确匹配，读取最近最多3页中标成交记录。</p>
+                <textarea id="cmpCompany" class="config-input" rows="3" placeholder="请输入企业全称，一行一家"></textarea>
+                <details style="margin:10px 0"><summary>补充官网开标公告／PDF附件（可选）</summary><p class="hint">用于核验已有公告的开标报价，不是搜索范围。最多5条，每行一条；仅支持全国公共资源交易、北京公共资源交易、中国政府采购网的HTTPS地址。未识别到明确企业报价行不会计作开标记录。</p><textarea id="cmpNoticeURLs" class="config-input" rows="2" placeholder="可选：粘贴官网公告或PDF附件地址"></textarea></details>
+                <div id="cmpPlatforms" style="margin:12px 0"></div>
+                <div style="display:flex;gap:10px"><button id="cmpStart" class="btn btn-primary" onclick="startCompetitorQuery()">检索竞品信息</button><button id="cmpStop" class="btn btn-outline" onclick="stopCompetitorQuery()" disabled>停止</button></div>
+                <p class="hint" style="margin-top:10px">企业信息、项目业绩与开标记录分开标注；合同金额不等同于投标报价。登录/验证码须人工处理，验证窗口打开在部署本服务的电脑上；仅复用本次服务运行期间的专用会话，重启后需重新登录，不读取普通Chrome的登录信息。</p>
+                <div id="cmpProgress" style="margin-top:10px">尚未查询</div>
+            </div>
+            <div class="card"><div class="card-title">竞品数据统计</div><div style="display:flex;gap:24px">今日新增：<strong id="cmpToday">0</strong> 当前企业记录：<strong id="cmpTotal">0</strong></div></div>
+            <div class="card"><div class="card-title">平台查询状态</div><div id="cmpStates"></div></div>
+            <div class="card"><div class="card-title">当前企业结果</div><p class="hint">按企业和记录类型归类，最多展示最近200条明细；统计覆盖全部已入库记录，保留来源字段及添加时间。不将来源明细数当作跨站去重后的项目数。</p><div id="cmpSummary" class="hint" style="margin:8px 0"></div><div id="cmpResults"></div></div>
+        </div>
+    </div>
     <div id="page-sites" class="page">
         <div class="container">
             <div class="card">
@@ -609,7 +627,7 @@
             </div>
             <div class="card">
                 <div class="card-title">➕ 自定义网站</div>
-                <p class="hint" style="margin-bottom:10px">添加任意招标网站URL，系统将尝试自动解析</p>
+                <p class="hint" style="margin-bottom:10px">固定页面采集请填写URL；按公司全称跨平台查询请使用底部“竞品”入口</p>
                 <div id="customSitesList"></div>
                 <button class="btn btn-outline" style="width:100%;margin-top:10px" onclick="showAddCustomSite()">➕
                     添加自定义网站</button>
@@ -660,7 +678,7 @@
             </div>
             <div class="card">
                 <div class="card-title">⚠️ 危险操作</div>
-                <button class="btn btn-danger" style="width:100%" onclick="clearHistory()">🗑️ 清空历史数据</button>
+                <select id="historyScope" class="config-input"><option value="bids">普通标讯</option><option value="competitors">竞品记录及版本</option><option value="all">全部标讯、竞品记录及版本</option></select><button class="btn btn-danger" style="width:100%" onclick="clearHistory()">🗑️ 清空历史数据</button>
             </div>
         </div>
     </div>
@@ -813,6 +831,7 @@
     <nav class="nav-tabs">
         <button class="nav-tab active" onclick="showPage('home')"><span class="nav-tab-icon">🏠</span>控制台</button>
         <button class="nav-tab" onclick="showPage('results')"><span class="nav-tab-icon">📋</span>结果</button>
+        <button class="nav-tab" onclick="showPage('competitors')"><span class="nav-tab-icon">🏢</span>竞品</button>
         <button class="nav-tab" onclick="showPage('sites')"><span class="nav-tab-icon">🌐</span>网站</button>
         <button class="nav-tab" onclick="showPage('contacts')"><span class="nav-tab-icon">👥</span>联系人</button>
         <button class="nav-tab" onclick="showPage('config')"><span class="nav-tab-icon">⚙️</span>配置</button>
@@ -828,16 +847,30 @@
             document.getElementById('page-' + n).classList.add('active');
             event.target.closest('.nav-tab').classList.add('active');
             if (n === 'results') loadResults();
+            if (n === 'competitors') loadCompetitors();
             if (n === 'config') loadConfig();
             if (n === 'sites') loadSites();
             if (n === 'contacts') loadContacts();
+        }
+
+        async function checkedFetch(url, options) {
+            const response = await fetch(url, options);
+            if (!response.ok) {
+                const error = await response.clone().json().catch(() => ({}));
+                throw new Error(typeof error.detail === 'string' ? error.detail : '请求失败 HTTP ' + response.status);
+            }
+            if (options && options.method && options.method !== 'GET') {
+                const data = await response.clone().json().catch(() => ({}));
+                if (data.success === false) throw new Error(data.message || '操作未成功');
+            }
+            return response;
         }
 
         async function refreshAll() { await refreshStatus(); loadLogs(); }
 
         async function refreshStatus() {
             try {
-                console.log('[DEBUG] Calling /api/status'); const res = await fetch(API + '/api/status');
+                console.log('[DEBUG] Calling /api/status'); const res = await checkedFetch(API + '/api/status');
                 const data = await res.json();
                 const dot = document.getElementById('statusDot'), text = document.getElementById('statusText');
                 if (data.is_running) {
@@ -909,7 +942,7 @@
 
         async function loadLogs() {
             try {
-                const res = await fetch(API + '/api/logs?limit=50');
+                const res = await checkedFetch(API + '/api/logs?limit=50');
                 const data = await res.json();
                 const c = document.getElementById('logsContainer');
 
@@ -936,13 +969,18 @@
             }
         }
 
+        function resultTimeLabel(item) {
+            if (item.collected_at) return '添加：' + item.collected_at;
+            return '添加时间未知';
+        }
+
         async function loadResults() {
             try {
-                const res = await fetch(API + '/api/results?limit=50');
+                const res = await checkedFetch(API + '/api/results?limit=50');
                 const data = await res.json();
                 const c = document.getElementById('resultsList');
                 if (data.items && data.items.length > 0) {
-                    c.innerHTML = data.items.map(i => `<div class="result-item"><div class="result-title"><a href="${i.url}" target="_blank">${escapeHtml(i.title)}</a></div><div class="result-meta"><span>📅 ${i.pub_date || '未知'}</span><span>📍 ${escapeHtml(i.source)}</span></div></div>`).join('');
+                    c.innerHTML = data.items.map(i => `<div class="result-item"><div class="result-title"><a href="${i.url}" target="_blank">${escapeHtml(i.title)}</a></div><div class="result-meta"><span>📅 ${escapeHtml(resultTimeLabel(i))}</span><span>📍 ${escapeHtml(i.source)}</span></div></div>`).join('');
                 } else {
                     c.innerHTML = '<div class="empty-state"><div class="empty-state-icon">📭</div><div>暂无招标信息</div></div>';
                 }
@@ -954,7 +992,7 @@
 
         async function loadConfig() {
             try {
-                const res = await fetch(API + '/api/config');
+                const res = await checkedFetch(API + '/api/config');
                 currentConfig = await res.json();
                 document.getElementById('cfgKeywords').value = currentConfig.keywords || '';
                 document.getElementById('cfgExclude').value = currentConfig.exclude || '';
@@ -971,14 +1009,14 @@
                 currentConfig.must_contain = document.getElementById('cfgMustContain').value;
                 currentConfig.interval = parseInt(document.getElementById('cfgInterval').value);
                 currentConfig.use_selenium = document.getElementById('cfgSelenium').checked;
-                await fetch(API + '/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentConfig) });
+                await checkedFetch(API + '/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentConfig) });
                 alert('配置已保存！');
-            } catch (e) { alert('保存失败: ' + e.message); }
+            } catch (e) { alert('保存失败: ' + e.message); await loadConfig(); await loadCustomSites(); await loadContacts(); }
         }
 
         async function loadSites() {
             try {
-                const res = await fetch(API + '/api/sites');
+                const res = await checkedFetch(API + '/api/sites');
                 currentSites = await res.json();
                 renderSites();
                 loadCustomSites();
@@ -999,7 +1037,7 @@
 
         async function loadCustomSites() {
             try {
-                const res = await fetch(API + '/api/custom-sites');
+                const res = await checkedFetch(API + '/api/custom-sites');
                 currentCustomSites = await res.json();
                 renderCustomSites();
             } catch (e) {
@@ -1030,19 +1068,19 @@
             if (!name || !url) { alert('请填写网站名称和URL'); return; }
             currentCustomSites.push({ name, url });
             try {
-                await fetch(API + '/api/custom-sites', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentCustomSites) });
+                await checkedFetch(API + '/api/custom-sites', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentCustomSites) });
                 closeModal('customSiteModal');
                 renderCustomSites();
-            } catch (e) { alert('保存失败: ' + e.message); }
+            } catch (e) { alert('保存失败: ' + e.message); await loadConfig(); await loadCustomSites(); await loadContacts(); }
         }
 
         async function deleteCustomSite(i) {
             if (!confirm('确定删除此自定义网站？')) return;
             currentCustomSites.splice(i, 1);
             try {
-                await fetch(API + '/api/custom-sites', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentCustomSites) });
+                await checkedFetch(API + '/api/custom-sites', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentCustomSites) });
                 renderCustomSites();
-            } catch (e) { alert('删除失败: ' + e.message); }
+            } catch (e) { alert('删除失败: ' + e.message); await loadCustomSites(); await loadContacts(); }
         }
 
         function selectAllSites() { currentSites.forEach(s => s.enabled = true); renderSites(); }
@@ -1051,14 +1089,14 @@
         async function saveSites() {
             try {
                 const enabledSites = currentSites.filter(s => s.enabled).map(s => s.key);
-                await fetch(API + '/api/sites', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(enabledSites) });
+                await checkedFetch(API + '/api/sites', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(enabledSites) });
                 alert('网站配置已保存！');
-            } catch (e) { alert('保存失败: ' + e.message); }
+            } catch (e) { alert('保存失败: ' + e.message); await loadConfig(); await loadCustomSites(); await loadContacts(); }
         }
 
         async function loadContacts() {
             try {
-                const res = await fetch(API + '/api/contacts');
+                const res = await checkedFetch(API + '/api/contacts');
                 currentContacts = await res.json();
                 renderContacts();
             } catch (e) {
@@ -1107,6 +1145,7 @@
 
         async function saveContact() {
             const contact = {
+                id: editingContactIndex >= 0 ? currentContacts[editingContactIndex].id : undefined,
                 name: document.getElementById('contactName').value,
                 phone: document.getElementById('contactPhone').value,
                 email: document.getElementById('contactEmail').value,
@@ -1123,19 +1162,19 @@
                 currentContacts.push(contact);
             }
             try {
-                await fetch(API + '/api/contacts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentContacts) });
+                await checkedFetch(API + '/api/contacts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentContacts) });
                 closeContactModal();
-                renderContacts();
-            } catch (e) { alert('保存失败: ' + e.message); }
+                await loadContacts();
+            } catch (e) { alert('保存失败: ' + e.message); await loadConfig(); await loadCustomSites(); await loadContacts(); }
         }
 
         async function deleteContact(i) {
             if (!confirm('确定删除此联系人？')) return;
             currentContacts.splice(i, 1);
             try {
-                await fetch(API + '/api/contacts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentContacts) });
+                await checkedFetch(API + '/api/contacts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentContacts) });
                 renderContacts();
-            } catch (e) { alert('删除失败: ' + e.message); }
+            } catch (e) { alert('删除失败: ' + e.message); await loadCustomSites(); await loadContacts(); }
         }
 
         function closeModal(id) { document.getElementById(id).classList.remove('active'); }
@@ -1170,7 +1209,7 @@
             if (!phone) { alert('请输入测试手机号'); return; }
             await saveSmsConfig();
             try {
-                const res = await fetch(API + '/api/test/sms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone }) });
+                const res = await checkedFetch(API + '/api/test/sms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone }) });
                 const data = await res.json();
                 alert(data.message);
             } catch (e) { alert('测试失败: ' + e.message); }
@@ -1206,7 +1245,7 @@
             if (!phone) { alert('请输入测试手机号'); return; }
             await saveVoiceConfig();
             try {
-                const res = await fetch(API + '/api/test/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone }) });
+                const res = await checkedFetch(API + '/api/test/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone }) });
                 const data = await res.json();
                 alert(data.message);
             } catch (e) { alert('测试失败: ' + e.message); }
@@ -1237,7 +1276,7 @@
         async function testAi() {
             await saveAiConfig();
             try {
-                const res = await fetch(API + '/api/test/ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+                const res = await checkedFetch(API + '/api/test/ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
                 const data = await res.json();
                 alert(data.message);
             } catch (e) { alert('测试失败: ' + e.message); }
@@ -1245,9 +1284,9 @@
 
         async function saveFullConfig() {
             try {
-                await fetch(API + '/api/config/full', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentConfig) });
+                await checkedFetch(API + '/api/config/full', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(currentConfig) });
                 alert('配置已保存！');
-            } catch (e) { alert('保存失败: ' + e.message); }
+            } catch (e) { alert('保存失败: ' + e.message); await loadConfig(); await loadCustomSites(); await loadContacts(); }
         }
 
         async function testContactNotify() {
@@ -1258,26 +1297,26 @@
             let results = [];
             if (phone) {
                 try {
-                    let res = await fetch(API + '/api/test/sms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone }) });
+                    let res = await checkedFetch(API + '/api/test/sms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone }) });
                     let data = await res.json();
                     results.push('短信: ' + data.message);
                 } catch (e) { results.push('短信测试失败'); }
                 try {
-                    let res = await fetch(API + '/api/test/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone }) });
+                    let res = await checkedFetch(API + '/api/test/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ phone }) });
                     let data = await res.json();
                     results.push('语音: ' + data.message);
                 } catch (e) { results.push('语音测试失败'); }
             }
             if (email) {
                 try {
-                    let res = await fetch(API + '/api/test/email', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
+                    let res = await checkedFetch(API + '/api/test/email', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
                     let data = await res.json();
                     results.push('邮件: ' + data.message);
                 } catch (e) { results.push('邮件测试失败'); }
             }
             if (token) {
                 try {
-                    let res = await fetch(API + '/api/test/wechat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) });
+                    let res = await checkedFetch(API + '/api/test/wechat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) });
                     let data = await res.json();
                     results.push('微信: ' + data.message);
                 } catch (e) { results.push('微信测试失败'); }
@@ -1287,7 +1326,7 @@
 
         async function startMonitor() {
             try {
-                const res = await fetch(API + '/api/start', { method: 'POST' });
+                const res = await checkedFetch(API + '/api/start', { method: 'POST' });
                 const data = await res.json();
                 alert(data.message);
                 refreshStatus();
@@ -1297,7 +1336,7 @@
 
         async function stopMonitor() {
             try {
-                const res = await fetch(API + '/api/stop', { method: 'POST' });
+                const res = await checkedFetch(API + '/api/stop', { method: 'POST' });
                 const data = await res.json();
                 alert(data.message);
                 refreshStatus();
@@ -1306,7 +1345,7 @@
 
         async function runOnce() {
             try {
-                const res = await fetch(API + '/api/run-once', { method: 'POST' });
+                const res = await checkedFetch(API + '/api/run-once', { method: 'POST' });
                 const data = await res.json();
                 alert(data.message);
                 refreshStatus();  // 立即刷新状态
@@ -1317,18 +1356,22 @@
         async function clearLogs() {
             if (!confirm('确定要清除所有日志吗？')) return;
             try {
-                await fetch(API + '/api/logs', { method: 'DELETE' });
+                await checkedFetch(API + '/api/logs', { method: 'DELETE' });
                 document.getElementById('logsContainer').innerHTML = '<div class="log-line">日志已清除</div>';
             } catch (e) { alert('清除失败: ' + e.message); }
         }
 
         async function clearHistory() {
-            if (!confirm('确定要清空所有历史数据吗？')) return;
+            const scope = document.getElementById('historyScope').value;
+            const label = document.getElementById('historyScope').selectedOptions[0].textContent;
+            if (!confirm('确定永久清空：' + label + '？此操作无法撤销。')) return;
             try {
-                const res = await fetch(API + '/api/history', { method: 'DELETE' });
+                const res = await checkedFetch(API + '/api/history?confirm=true&scope=' + encodeURIComponent(scope), { method: 'DELETE' });
                 const data = await res.json();
                 alert(data.message);
-                refreshStatus();
+                await refreshStatus();
+                await loadResults();
+                if (competitorLoaded) await refreshCompetitors();
             } catch (e) { alert('操作失败: ' + e.message); }
         }
 
@@ -1345,6 +1388,7 @@
         setInterval(refreshStatus, 5000);
         setInterval(loadLogs, 5000);
     </script>
+    <script src="/static/competitors.js"></script>
 </body>
 
 </html>

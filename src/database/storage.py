@@ -9,6 +9,8 @@ import sqlite3
 import hashlib
 import os
 import threading
+from pathlib import Path
+from contextlib import closing
 from datetime import datetime
 from typing import List, Optional
 from dataclasses import dataclass
@@ -23,11 +25,25 @@ class BidInfo:
     source: str
     content: str = ""
     purchaser: str = ""
+    created_at: str = ""  # SQLite 入库时间，UTC；不是来源发布日期。
     
     @property
     def unique_id(self) -> str:
         """生成唯一标识（基于URL的MD5）"""
         return hashlib.md5(self.url.encode()).hexdigest()
+
+
+def default_db_path():
+    root = Path(__file__).resolve().parents[2]
+    override = os.environ.get('BIDMONITOR_DB_PATH')
+    if override:
+        path = Path(override).expanduser()
+        return str((path if path.is_absolute() else root / path).resolve())
+    candidates = [root / 'server/data/bids.db', root / 'data/bids.db']
+    existing = [p for p in candidates if p.is_file()]
+    if len(existing) > 1:
+        raise RuntimeError('发现两个历史数据库，请备份后设置 BIDMONITOR_DB_PATH 指定使用哪个；未自动覆盖或合并')
+    return str((existing[0] if existing else candidates[0]).resolve())
 
 
 class Storage:
@@ -37,7 +53,8 @@ class Storage:
     避免频繁创建和关闭连接带来的性能开销。
     """
     
-    def __init__(self, db_path: str = "data/bids.db"):
+    def __init__(self, db_path: str = None):
+        db_path = str(Path(db_path).resolve()) if db_path else default_db_path()
         self.db_path = db_path
         # 线程本地存储，用于复用数据库连接
         self._local = threading.local()
@@ -64,7 +81,7 @@ class Storage:
     
     def _init_db(self):
         """初始化数据库表"""
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS bids (
@@ -161,7 +178,7 @@ class Storage:
         conn = self._get_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT title, url, publish_date, source, content, purchaser
+            SELECT title, url, publish_date, source, content, purchaser, created_at
             FROM bids WHERE notified = 0
         """)
         rows = cursor.fetchall()
@@ -172,7 +189,8 @@ class Storage:
                 publish_date=row[2],
                 source=row[3],
                 content=row[4],
-                purchaser=row[5]
+                purchaser=row[5],
+                created_at=row[6]
             )
             for row in rows
         ]
@@ -182,7 +200,7 @@ class Storage:
         conn = self._get_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT title, url, publish_date, source, content, purchaser
+            SELECT title, url, publish_date, source, content, purchaser, created_at
             FROM bids 
             WHERE datetime(created_at) > datetime('now', ?)
             ORDER BY created_at DESC
@@ -195,7 +213,8 @@ class Storage:
                 publish_date=row[2],
                 source=row[3],
                 content=row[4],
-                purchaser=row[5]
+                purchaser=row[5],
+                created_at=row[6]
             )
             for row in rows
         ]
@@ -205,7 +224,7 @@ class Storage:
         conn = self._get_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT title, url, publish_date, source, content, purchaser
+            SELECT title, url, publish_date, source, content, purchaser, created_at
             FROM bids 
             ORDER BY created_at DESC
         """)
@@ -217,7 +236,8 @@ class Storage:
                 publish_date=row[2],
                 source=row[3],
                 content=row[4],
-                purchaser=row[5]
+                purchaser=row[5],
+                created_at=row[6]
             )
             for row in rows
         ]
@@ -229,9 +249,16 @@ class Storage:
         cursor.execute("SELECT COUNT(*) FROM bids")
         return cursor.fetchone()[0]
 
-    def clear_all(self):
-        """清空所有数据"""
+    def clear_all(self, scope='bids'):
+        """Clear an explicit scope atomically. Default preserves legacy GUI semantics."""
+        if scope not in ('bids', 'competitors', 'all'):
+            raise ValueError('无效清理范围')
         conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM bids")
-        conn.commit()
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        with conn:
+            if scope in ('bids', 'all'):
+                conn.execute('DELETE FROM bids')
+            if scope in ('competitors', 'all'):
+                for table in ('competitor_observations', 'competitor_records'):
+                    if table in tables:
+                        conn.execute('DELETE FROM ' + table)

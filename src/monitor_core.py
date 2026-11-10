@@ -105,6 +105,11 @@ def get_default_sites():
     }
 
 
+import threading
+
+_MONITOR_RUN_LOCK = threading.Lock()
+
+
 class MonitorCore:
     """监控核心类"""
     
@@ -118,7 +123,8 @@ class MonitorCore:
                  email_config: Dict[str, Any] = None,
                  sms_config: Dict[str, Any] = None,
                  log_callback: Callable[[str], None] = None,
-                 ai_config: Dict[str, Any] = None):
+                 ai_config: Dict[str, Any] = None,
+                 db_path: str = None):
         """
         初始化监控核心
         
@@ -142,7 +148,7 @@ class MonitorCore:
         self.log_callback = log_callback or (lambda x: None)
         
         # 初始化组件
-        self.storage = Storage()
+        self.storage = Storage(db_path)
         self.matcher = KeywordMatcher(keywords, exclude_keywords, must_contain_keywords)
         
         # 加载配置文件
@@ -279,6 +285,19 @@ class MonitorCore:
         self.log_callback(message)
     
     def run_once(self, progress_callback=None, stop_event=None) -> Dict[str, Any]:
+        if not _MONITOR_RUN_LOCK.acquire(blocking=False):
+            raise RuntimeError('已有采集任务使用共享浏览器，请等待完成')
+        try:
+            return self._run_once(progress_callback, stop_event)
+        finally:
+            try:
+                from crawler.selenium_crawler import SharedBrowserManager
+                SharedBrowserManager.close()
+            finally:
+                self.storage.close()
+                _MONITOR_RUN_LOCK.release()
+
+    def _run_once(self, progress_callback=None, stop_event=None) -> Dict[str, Any]:
         """
         执行一次监控
         
